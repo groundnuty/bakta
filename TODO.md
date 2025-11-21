@@ -70,6 +70,92 @@ data['features'].extend(rrnas)  # No intermediate cleanup
 
 **Impact**: Memory pressure for large genomes (>50MB assemblies)
 
+### 5. Expensive Object Copying ⚠️ **MEDIUM IMPACT**
+
+**Current State**: Deep object copying for complex data structures
+
+**Location**: `bakta/features/cds.py:469`
+```python
+seleno_cds = copy.deepcopy(cds_a)  # Full object tree duplication
+```
+
+**Impact**: CPU overhead and memory fragmentation during selenocysteine processing
+
+### 6. Inefficient String Concatenation ⚠️ **LOW-MEDIUM IMPACT**
+
+**Current State**: Multiple string operations for sequence formatting
+
+**Location**: `bakta/io/fasta.py:79-83`
+```python
+def wrap_sequence(sequence: str):
+    lines = []
+    for i in range(0, len(sequence), FASTA_LINE_WRAPPING):
+        lines.append(sequence[i:i + FASTA_LINE_WRAPPING])  # List growing
+    return '\n'.join(lines) + '\n'  # Final concatenation
+```
+
+**Impact**: Memory allocation churn for large sequences
+
+### 7. Database Connection Thrashing ⚠️ **MEDIUM-HIGH IMPACT**
+
+**Current State**: Multiple independent SQLite connections per module
+
+**Location**: `ups.py:30`, `ips.py:32`, `psc.py:112`, `pscc.py:100`
+```python
+# Each module creates separate connections
+with sqlite3.connect(f"file:{cfg.db_path.joinpath('bakta.db')}?mode=ro...") as conn:
+    with ThreadPoolExecutor(max_workers=max(10, cfg.threads)) as tpe:
+```
+
+**Impact**: Connection overhead, lock contention, resource waste
+
+### 8. Excessive Temporary File I/O ⚠️ **MEDIUM IMPACT**
+
+**Current State**: Every database search creates temporary files
+
+**Locations**:
+- `psc.py:32-34` - PSC search files
+- `pscc.py:25-27` - PSCC search files
+- `expert/amrfinder.py:17-21` - AMRFinder files
+- `expert/protein_sequences.py:21` - Expert system files
+- `features/crispr.py:23` - CRISPR prediction files
+- `features/nc_rna.py:23` - ncRNA files
+- `features/t_rna.py:48-49` - tRNA files
+
+```python
+# Pattern repeated across modules:
+cds_aa_path = cfg.tmp_path.joinpath('module.faa')
+diamond_output_path = cfg.tmp_path.joinpath('diamond.module.tsv')
+```
+
+**Impact**: Disk I/O bottleneck, cleanup overhead, storage requirements
+
+### 9. Suboptimal Thread Pool Strategy ⚠️ **MEDIUM IMPACT**
+
+**Current State**: Mixed I/O and CPU-bound tasks in same pools
+
+**Analysis**:
+- Database lookups (I/O bound): Use `max(10, cfg.threads)`
+- Gene prediction (CPU bound): Use `cfg.threads`
+- No distinction between workload types
+
+**Impact**: Thread contention between different workload characteristics
+
+### 10. Memory Inefficient Feature Accumulation ⚠️ **MEDIUM IMPACT**
+
+**Current State**: Progressive feature list growth without cleanup
+
+**Location**: `main.py:164-266`
+```python
+data['features'].extend(trnas)    # ~157
+data['features'].extend(tmrnas)   # ~177
+data['features'].extend(rrnas)    # ~189
+data['features'].extend(ncrnas)   # ~201
+# ... continues growing throughout pipeline
+```
+
+**Impact**: Peak memory usage during annotation pipeline
+
 ---
 
 ## Implementation Roadmap
@@ -111,39 +197,61 @@ def parallel_rna_prediction(data, sequences_path):
 - [ ] Test with various genome sizes
 - [ ] Benchmark performance improvements
 
-#### Priority 2: Database Connection Pool 🔄
+#### Priority 2: Database Connection Pool & Query Optimization 🔄
 
 **Status**: ⬜ TODO
 **Assignee**: TBD
-**Estimated Effort**: 3-5 days
+**Estimated Effort**: 4-6 days
 
-**Implementation Plan**:
+**Enhanced Implementation Plan**:
 ```python
 class DatabaseManager:
     def __init__(self, db_path, pool_size=10):
         self.db_path = db_path
         self.connection_pool = queue.Queue(maxsize=pool_size)
-        # Pre-populate pool with read-only connections
+        self.prepared_statements = {}
+        # Pre-populate pool with optimized connections
+
+    def initialize_pool(self):
+        """Create connections with optimal SQLite settings"""
+        conn_string = f"file:{self.db_path}?mode=ro&nolock=1&cache=shared"
+        for _ in range(pool_size):
+            conn = sqlite3.connect(conn_string, uri=True, check_same_thread=False)
+            # Optimization pragmas
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=-64000')  # 64MB cache
+            conn.execute('PRAGMA temp_store=MEMORY')
+            conn.execute('PRAGMA mmap_size=268435456')  # 256MB mmap
+            self.connection_pool.put(conn)
 
     @contextmanager
     def get_connection(self):
         """Get pooled database connection"""
-        conn = self.connection_pool.get()
+        conn = self.connection_pool.get(timeout=30)
         try:
             yield conn
         finally:
             self.connection_pool.put(conn)
+
+    def prepare_statement(self, sql):
+        """Cache prepared statements for reuse"""
+        if sql not in self.prepared_statements:
+            self.prepared_statements[sql] = sql
+        return self.prepared_statements[sql]
 ```
 
-**Expected Benefit**: 20-30% reduction in database query overhead
-**Risk Level**: Low (minimal API changes)
+**Expected Benefit**: 30-45% reduction in database query overhead
+**Risk Level**: Medium (requires coordination across modules)
 
-**Tasks**:
-- [ ] Design database connection pool class
-- [ ] Integrate with existing SQLite queries
-- [ ] Add connection health monitoring
-- [ ] Implement graceful pool shutdown
-- [ ] Performance testing
+**Enhanced Tasks**:
+- [ ] Design unified database connection pool
+- [ ] Implement SQLite performance optimizations
+- [ ] Add prepared statement caching
+- [ ] Replace all module-specific connections
+- [ ] Add connection monitoring and health checks
+- [ ] Implement graceful shutdown and error recovery
+- [ ] Performance benchmarking with different pool sizes
 
 #### Priority 3: Enhanced Threading Strategy ⚡
 
